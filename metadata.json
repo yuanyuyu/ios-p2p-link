@@ -1,0 +1,8 @@
+{
+  "name": "iOS P2P Link",
+  "description": "A serverless, install-free P2P communication tool optimized for iPhone. Supports video calls, text, and media sharing.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
