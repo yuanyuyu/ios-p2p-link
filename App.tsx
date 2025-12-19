@@ -15,6 +15,7 @@ const App: React.FC = () => {
   const [activeTargetId, setActiveTargetId] = useState<string>('');
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [copied, setCopied] = useState(false);
   
   const [isInCall, setIsInCall] = useState(false);
   const [isIncomingCall, setIsIncomingCall] = useState(false);
@@ -34,12 +35,11 @@ const App: React.FC = () => {
     if (!Peer) return;
 
     const newPeer = new Peer(peerId, {
-      debug: 2, // 增加调试级别以便观察连接过程
+      debug: 1,
       config: {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
           { urls: 'stun:global.stun.twilio.com:3478' }
         ]
       }
@@ -49,36 +49,37 @@ const App: React.FC = () => {
       console.log('My Peer ID:', id);
     });
 
+    // 接收端处理
     newPeer.on('connection', (conn: any) => {
+      console.log('Incoming connection from:', conn.peer);
       setActiveTargetId(conn.peer);
-      handleConnection(conn);
+      
+      // 重要：等待连接真正开启再处理
+      if (conn.open) {
+        handleConnection(conn);
+      } else {
+        conn.on('open', () => handleConnection(conn));
+      }
     });
 
-    // 关键：处理呼入通话
     newPeer.on('call', (call: any) => {
-      console.log('Incoming call from:', call.peer);
       callRef.current = call;
       setActiveTargetId(call.peer);
       setIsIncomingCall(true);
       setIsInCall(true);
 
-      // 在呼入时就绑定流监听，确保对方视频流一到就能捕获
       call.on('stream', (remote: MediaStream) => {
-        console.log('Callee received remote stream');
         setRemoteStream(remote);
       });
 
       call.on('close', endCall);
-      call.on('error', (err: any) => {
-        console.error('Call error:', err);
-        endCall();
-      });
+      call.on('error', endCall);
     });
 
     newPeer.on('error', (err: any) => {
       console.error('Peer error:', err);
       if (err.type === 'peer-unavailable') {
-        setStatus(ConnectionStatus.DISCONNECTED);
+        setStatus(ConnectionStatus.ERROR);
       }
     });
 
@@ -91,7 +92,7 @@ const App: React.FC = () => {
   }, []);
 
   const handleConnection = (conn: any) => {
-    if (connRef.current && connRef.current.open) {
+    if (connRef.current && connRef.current.open && connRef.current.peer !== conn.peer) {
       connRef.current.close();
     }
 
@@ -104,12 +105,18 @@ const App: React.FC = () => {
     }
 
     conn.on('data', (data: ChatMessage) => {
+      console.log('Received data:', data.type);
       setMessages((prev) => [...prev, data]);
     });
 
     conn.on('close', () => {
       setStatus(ConnectionStatus.DISCONNECTED);
       endCall();
+    });
+
+    conn.on('error', (err: any) => {
+      console.error('Connection error:', err);
+      setStatus(ConnectionStatus.ERROR);
     });
   };
 
@@ -123,10 +130,9 @@ const App: React.FC = () => {
     const attempt = () => {
       if (!peerRef.current || peerRef.current.destroyed) return;
       
-      console.log(`Attempting data connection to ${idToConnect}...`);
+      // 使用默认序列化（binary），删除 serialization: 'json'
       const conn = peerRef.current.connect(idToConnect, {
-        reliable: true,
-        serialization: 'json'
+        reliable: true
       });
       
       conn.on('open', () => handleConnection(conn));
@@ -145,14 +151,14 @@ const App: React.FC = () => {
     }, 5000);
   };
 
-  const sendMessage = (content: string, type: MessageType = MessageType.TEXT, fileName?: string) => {
+  const sendMessage = (content: any, type: MessageType = MessageType.TEXT, fileName?: string) => {
     if (!connRef.current || !myId) return;
 
     const msg: ChatMessage = {
       id: uuidv4(),
       senderId: myId, 
       type,
-      content,
+      content, // 这里可能是 string 或 Blob
       timestamp: Date.now(),
       fileName
     };
@@ -168,7 +174,6 @@ const App: React.FC = () => {
   const startCall = async () => {
     if (!activeTargetId) return;
     try {
-      console.log('Starting call to:', activeTargetId);
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
       setIsInCall(true);
@@ -177,36 +182,29 @@ const App: React.FC = () => {
       callRef.current = call;
 
       call.on('stream', (remote: MediaStream) => {
-        console.log('Caller received remote stream from answer');
         setRemoteStream(remote);
       });
-
       call.on('close', endCall);
       call.on('error', endCall);
     } catch (err) {
-      console.error('Media access error:', err);
-      alert('Cannot access camera/microphone');
+      alert('Camera access denied');
     }
   };
 
   const answerCall = async () => {
     if (!callRef.current) return;
     try {
-      console.log('Answering call...');
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
       setIsIncomingCall(false);
-      // 必须先建立本地流再 answer
       callRef.current.answer(stream);
     } catch (err) {
-      console.error('Error answering call:', err);
-      alert('Could not start camera for answer');
+      console.error(err);
       endCall();
     }
   };
 
   const endCall = () => {
-    console.log('Ending call and cleaning up streams');
     if (callRef.current) {
       callRef.current.close();
       callRef.current = null;
@@ -229,6 +227,8 @@ const App: React.FC = () => {
 
   const copyMyId = () => {
     navigator.clipboard.writeText(myId);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   if (isInCall) {
@@ -244,48 +244,54 @@ const App: React.FC = () => {
     );
   }
 
+  // Welcome / ID Screen
   if (status === ConnectionStatus.DISCONNECTED && messages.length === 0 && !activeTargetId) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-white safe-top safe-bottom">
-        <div className="w-full max-w-sm space-y-10">
-          <div className="text-center space-y-2">
-            <div className="w-20 h-20 bg-blue-600 rounded-[22px] flex items-center justify-center mx-auto shadow-2xl shadow-blue-200 mb-6 rotate-3">
-              <i className="ph-fill ph-broadcast text-4xl text-white"></i>
+      <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-white safe-top safe-bottom animate-in fade-in duration-700">
+        <div className="w-full max-w-sm space-y-12">
+          <div className="text-center space-y-3">
+            <div className="w-24 h-24 bg-gradient-to-br from-blue-600 to-indigo-700 rounded-[28px] flex items-center justify-center mx-auto shadow-2xl shadow-blue-200 mb-8 rotate-3 transition-transform hover:rotate-0 duration-500">
+              <i className="ph-fill ph-broadcast text-5xl text-white"></i>
             </div>
-            <h1 className="text-3xl font-extrabold text-gray-900 tracking-tight">P2P Link</h1>
-            <p className="text-gray-500 font-medium">Fast, private, serverless.</p>
+            <h1 className="text-4xl font-black text-gray-900 tracking-tight">P2P Link</h1>
+            <p className="text-gray-400 font-medium text-lg">Fast, private, serverless.</p>
           </div>
 
-          <div className="space-y-6">
-            <div className="bg-gray-50 rounded-2xl p-5 border border-gray-100">
-              <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3">Your Sharing ID</p>
-              <div className="flex items-center justify-between bg-white rounded-xl p-3 border border-gray-100 shadow-sm">
-                <span className="text-2xl font-mono font-bold text-blue-600 tracking-widest">{myId || '......'}</span>
+          <div className="space-y-8">
+            {/* My ID Card */}
+            <div className="bg-gray-50 rounded-[24px] p-6 border border-gray-100 relative group">
+              <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] mb-4">Your Sharing ID</p>
+              <div className="flex items-center justify-between bg-white rounded-2xl p-4 border border-gray-100 shadow-sm transition-all group-hover:shadow-md group-hover:-translate-y-1">
+                <span className="text-3xl font-mono font-black text-blue-600 tracking-wider">{myId || '......'}</span>
                 <button 
                   onClick={copyMyId}
-                  className="p-2 hover:bg-gray-50 rounded-lg text-gray-400 active:text-blue-500 transition-colors"
+                  className={`p-3 rounded-xl transition-all flex items-center gap-2 ${
+                    copied ? 'bg-green-50 text-green-600' : 'bg-gray-50 text-gray-400 hover:text-blue-600 active:scale-90'
+                  }`}
                 >
-                  <i className="ph-bold ph-copy text-xl"></i>
+                  <i className={`ph-bold ${copied ? 'ph-check' : 'ph-copy'} text-xl`}></i>
+                  {copied && <span className="text-xs font-bold uppercase">Copied</span>}
                 </button>
               </div>
             </div>
 
-            <div className="space-y-3">
-              <p className="text-xs font-bold text-gray-400 uppercase tracking-widest px-1">Connect to Peer</p>
-              <div className="relative">
+            {/* Target ID Input */}
+            <div className="space-y-4">
+              <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] px-1">Connect to Peer</p>
+              <div className="relative group">
                 <input 
                   type="text"
-                  placeholder="Enter Friend's ID"
+                  placeholder="FRIEND'S ID"
                   value={targetIdInput}
                   onChange={(e) => setTargetIdInput(e.target.value.toUpperCase())}
-                  className="w-full bg-gray-50 border-none rounded-2xl p-4 pl-12 text-lg font-bold placeholder:text-gray-300 focus:ring-2 focus:ring-blue-500 transition-all uppercase"
+                  className="w-full bg-gray-50 border-2 border-transparent rounded-[24px] p-5 pl-14 text-xl font-black placeholder:text-gray-200 focus:bg-white focus:border-blue-500 transition-all uppercase tracking-widest"
                 />
-                <i className="ph-bold ph-user-focus absolute left-4 top-1/2 -translate-y-1/2 text-gray-300 text-xl"></i>
+                <i className="ph-bold ph-user-focus absolute left-5 top-1/2 -translate-y-1/2 text-gray-300 text-2xl transition-colors group-focus-within:text-blue-500"></i>
               </div>
               <button 
                 disabled={!targetIdInput}
                 onClick={() => connectToPeer()}
-                className="w-full py-4 rounded-2xl bg-black text-white font-bold text-lg shadow-xl shadow-gray-200 active:scale-95 transition-all disabled:bg-gray-200 disabled:shadow-none"
+                className="w-full py-5 rounded-[24px] bg-gray-900 text-white font-black text-lg shadow-2xl shadow-gray-200 active:scale-95 hover:bg-black transition-all disabled:bg-gray-100 disabled:text-gray-300 disabled:shadow-none mt-2"
               >
                 Join Channel
               </button>
@@ -298,21 +304,21 @@ const App: React.FC = () => {
 
   return (
     <div className="h-full relative bg-white">
-      {status !== ConnectionStatus.CONNECTED && messages.length === 0 && (
-        <div className="absolute inset-0 z-10 bg-white flex flex-col items-center justify-center p-8 text-center animate-in fade-in duration-500">
-           <div className="relative mb-8">
-              <div className="w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center">
-                <span className="text-4xl font-black text-blue-600">{activeTargetId ? activeTargetId[0] : '?'}</span>
+      {(status !== ConnectionStatus.CONNECTED && messages.length === 0) && (
+        <div className="absolute inset-0 z-30 bg-white flex flex-col items-center justify-center p-8 text-center animate-in fade-in zoom-in duration-500">
+           <div className="relative mb-10">
+              <div className="w-32 h-32 bg-blue-50 rounded-full flex items-center justify-center scale-110">
+                <span className="text-5xl font-black text-blue-600">{activeTargetId ? activeTargetId[0] : '?'}</span>
               </div>
-              <div className="absolute inset-0 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+              <div className="absolute -inset-4 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
            </div>
-           <h2 className="text-2xl font-black text-gray-900 mb-2">Connecting</h2>
-           <p className="text-gray-400 font-medium mb-10">Linking with peer {activeTargetId}...</p>
+           <h2 className="text-3xl font-black text-gray-900 mb-3">Connecting</h2>
+           <p className="text-gray-400 font-bold text-lg mb-12">Linking with peer <span className="text-blue-600">{activeTargetId}</span>...</p>
            <button 
              onClick={handleLogout}
-             className="px-8 py-3 rounded-full border-2 border-gray-100 text-gray-500 font-bold hover:bg-gray-50 transition"
+             className="px-12 py-4 rounded-2xl border-2 border-gray-100 text-gray-400 font-black uppercase tracking-widest hover:bg-red-50 hover:text-red-500 hover:border-red-100 transition-all active:scale-95"
            >
-             Cancel Attempt
+             Cancel Link
            </button>
         </div>
       )}

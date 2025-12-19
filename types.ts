@@ -1,3 +1,4 @@
+
 // PeerJS types are loaded via global script, but we define interfaces for safety
 export interface PeerJS {
   new (id?: string, options?: any): any;
@@ -25,7 +26,7 @@ export interface ChatMessage {
   id: string;
   senderId: string;
   type: MessageType;
-  content: string; // Text or Base64 data
+  content: any; // 更改为 any，支持 string 或 Blob
   timestamp: number;
   fileName?: string;
 }

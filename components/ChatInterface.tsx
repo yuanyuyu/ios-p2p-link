@@ -5,13 +5,46 @@ import { ChatMessage, MessageType, ConnectionStatus } from '../types';
 interface ChatInterfaceProps {
   messages: ChatMessage[];
   myId: string;
-  onSendMessage: (text: string, type?: MessageType, fileName?: string) => void;
+  onSendMessage: (text: any, type?: MessageType, fileName?: string) => void;
   onStartCall: () => void;
   remotePeerId: string;
   onDisconnect: () => void;
   status: ConnectionStatus;
   onReconnect: () => void;
 }
+
+const MediaMessage: React.FC<{ content: any; type: MessageType; fileName?: string }> = ({ content, type, fileName }) => {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    // 如果 content 是 Blob/File，创建一个临时的 Object URL
+    if (content instanceof Blob || content instanceof Uint8Array) {
+      const blob = content instanceof Uint8Array ? new Blob([content]) : content;
+      const objectUrl = URL.createObjectURL(blob);
+      setUrl(objectUrl);
+      return () => URL.revokeObjectURL(objectUrl);
+    } else if (typeof content === 'string') {
+      setUrl(content);
+    }
+  }, [content]);
+
+  if (!url) return <div className="w-40 h-40 bg-gray-200 animate-pulse rounded-xl" />;
+
+  if (type === MessageType.IMAGE) {
+    return <img src={url} alt="Shared" className="rounded-xl max-h-72 object-cover border border-black/5" />;
+  }
+
+  if (type === MessageType.VIDEO_FILE) {
+    return (
+      <div className="my-1">
+        <video src={url} controls className="rounded-xl max-h-72 w-full bg-black shadow-lg" />
+        {fileName && <p className="text-[10px] opacity-60 mt-2 font-bold truncate">{fileName}</p>}
+      </div>
+    );
+  }
+
+  return null;
+};
 
 const ChatInterface: React.FC<ChatInterfaceProps> = ({ 
   messages, 
@@ -45,19 +78,14 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     const file = e.target.files?.[0];
     if (!file || status !== ConnectionStatus.CONNECTED) return;
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const base64 = reader.result as string;
-      const type = file.type.startsWith('image/') ? MessageType.IMAGE : MessageType.VIDEO_FILE;
-      onSendMessage(base64, type, file.name);
-    };
-    reader.readAsDataURL(file);
+    // 直接发送 File 对象（PeerJS 会处理二进制打包）
+    const type = file.type.startsWith('image/') ? MessageType.IMAGE : MessageType.VIDEO_FILE;
+    onSendMessage(file, type, file.name);
+
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const isConnected = status === ConnectionStatus.CONNECTED;
-  const isDisconnected = status === ConnectionStatus.DISCONNECTED || status === ConnectionStatus.ERROR;
-  const isConnecting = status === ConnectionStatus.CONNECTING;
 
   return (
     <div className="flex flex-col h-full bg-white">
@@ -72,18 +100,18 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                 Peer {remotePeerId}
               </h1>
               <p className={`text-[10px] uppercase tracking-widest font-black flex items-center gap-1.5 mt-1.5 ${
-                isConnected ? "text-green-500" : isConnecting ? "text-orange-500" : "text-gray-300"
+                isConnected ? "text-green-500" : "text-orange-500"
               }`}>
                   <span className={`w-1.5 h-1.5 rounded-full ${
-                    isConnected ? "bg-green-500 animate-pulse" : isConnecting ? "bg-orange-500 animate-bounce" : "bg-gray-300"
+                    isConnected ? "bg-green-500 animate-pulse" : "bg-orange-500 animate-bounce"
                   }`}></span>
-                  {isConnected ? "Secure" : isConnecting ? "Linking" : "Paused"}
+                  {isConnected ? "Secure" : "Connecting"}
               </p>
             </div>
         </div>
         
         <div className="flex gap-2">
-          {isDisconnected && messages.length > 0 && (
+          {!isConnected && messages.length > 0 && (
             <button 
               onClick={onReconnect}
               className="w-10 h-10 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center active:bg-blue-100 transition"
@@ -126,17 +154,8 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
               >
                 {msg.type === MessageType.TEXT && <p className="text-[15px] font-medium leading-relaxed break-words">{msg.content}</p>}
                 
-                {msg.type === MessageType.IMAGE && (
-                  <div className="my-1">
-                    <img src={msg.content} alt="Shared" className="rounded-xl max-h-72 object-cover border border-black/5" />
-                  </div>
-                )}
-
-                {msg.type === MessageType.VIDEO_FILE && (
-                   <div className="my-1">
-                     <video src={msg.content} controls className="rounded-xl max-h-72 w-full bg-black shadow-lg" />
-                     {msg.fileName && <p className="text-[10px] opacity-60 mt-2 font-bold truncate">{msg.fileName}</p>}
-                   </div>
+                {(msg.type === MessageType.IMAGE || msg.type === MessageType.VIDEO_FILE) && (
+                  <MediaMessage content={msg.content} type={msg.type} fileName={msg.fileName} />
                 )}
                 
                 <span className={`text-[9px] font-black uppercase tracking-tighter mt-1.5 block opacity-40`}>
