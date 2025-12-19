@@ -34,27 +34,28 @@ const App: React.FC = () => {
     const Peer = (window as any).Peer;
     if (!Peer) return;
 
+    // 增强 STUN 服务器配置，确保 NAT 穿透成功率
     const newPeer = new Peer(peerId, {
       debug: 1,
       config: {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
           { urls: 'stun:global.stun.twilio.com:3478' }
         ]
       }
     });
 
     newPeer.on('open', (id: string) => {
-      console.log('My Peer ID:', id);
+      console.log('Peer system ready. My ID:', id);
     });
 
-    // 接收端处理
     newPeer.on('connection', (conn: any) => {
-      console.log('Incoming connection from:', conn.peer);
+      console.log('Peer connected via data channel:', conn.peer);
       setActiveTargetId(conn.peer);
-      
-      // 重要：等待连接真正开启再处理
       if (conn.open) {
         handleConnection(conn);
       } else {
@@ -62,22 +63,29 @@ const App: React.FC = () => {
       }
     });
 
+    // 接收端处理呼入
     newPeer.on('call', (call: any) => {
+      console.log('Receiving call from:', call.peer);
       callRef.current = call;
       setActiveTargetId(call.peer);
       setIsIncomingCall(true);
       setIsInCall(true);
 
+      // 接收端监听发起方的流
       call.on('stream', (remote: MediaStream) => {
+        console.log('Callee received remote stream from caller');
         setRemoteStream(remote);
       });
 
       call.on('close', endCall);
-      call.on('error', endCall);
+      call.on('error', (err: any) => {
+        console.error('Call connection error:', err);
+        endCall();
+      });
     });
 
     newPeer.on('error', (err: any) => {
-      console.error('Peer error:', err);
+      console.error('Global Peer Error:', err.type, err);
       if (err.type === 'peer-unavailable') {
         setStatus(ConnectionStatus.ERROR);
       }
@@ -87,7 +95,7 @@ const App: React.FC = () => {
 
     return () => {
       if (retryIntervalRef.current) clearInterval(retryIntervalRef.current);
-      peerRef.current?.destroy();
+      if (peerRef.current) peerRef.current.destroy();
     };
   }, []);
 
@@ -95,7 +103,6 @@ const App: React.FC = () => {
     if (connRef.current && connRef.current.open && connRef.current.peer !== conn.peer) {
       connRef.current.close();
     }
-
     connRef.current = conn;
     setStatus(ConnectionStatus.CONNECTED);
 
@@ -105,18 +112,12 @@ const App: React.FC = () => {
     }
 
     conn.on('data', (data: ChatMessage) => {
-      console.log('Received data:', data.type);
       setMessages((prev) => [...prev, data]);
     });
 
     conn.on('close', () => {
       setStatus(ConnectionStatus.DISCONNECTED);
       endCall();
-    });
-
-    conn.on('error', (err: any) => {
-      console.error('Connection error:', err);
-      setStatus(ConnectionStatus.ERROR);
     });
   };
 
@@ -129,88 +130,93 @@ const App: React.FC = () => {
     
     const attempt = () => {
       if (!peerRef.current || peerRef.current.destroyed) return;
-      
-      // 使用默认序列化（binary），删除 serialization: 'json'
-      const conn = peerRef.current.connect(idToConnect, {
-        reliable: true
-      });
-      
+      const conn = peerRef.current.connect(idToConnect, { reliable: true });
       conn.on('open', () => handleConnection(conn));
-      conn.on('error', (err: any) => console.warn("Connection attempt failed", err));
     };
 
     attempt();
-
     if (retryIntervalRef.current) clearInterval(retryIntervalRef.current);
     retryIntervalRef.current = setInterval(() => {
-      if (status === ConnectionStatus.CONNECTED) {
-        clearInterval(retryIntervalRef.current);
-        return;
-      }
-      attempt();
+      if (status !== ConnectionStatus.CONNECTED) attempt();
+      else clearInterval(retryIntervalRef.current);
     }, 5000);
   };
 
   const sendMessage = (content: any, type: MessageType = MessageType.TEXT, fileName?: string) => {
     if (!connRef.current || !myId) return;
-
     const msg: ChatMessage = {
       id: uuidv4(),
       senderId: myId, 
       type,
-      content, // 这里可能是 string 或 Blob
+      content,
       timestamp: Date.now(),
       fileName
     };
-
     try {
       connRef.current.send(msg);
       setMessages((prev) => [...prev, msg]);
     } catch (e) {
-      console.error("Send failed", e);
+      console.error("Failed to send message", e);
     }
   };
 
   const startCall = async () => {
-    if (!activeTargetId) return;
+    if (!activeTargetId || !peerRef.current) return;
     try {
+      console.log('Initiating call to:', activeTargetId);
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
       setIsInCall(true);
 
+      // 发起呼叫并传递本地流
       const call = peerRef.current.call(activeTargetId, stream);
       callRef.current = call;
 
+      // 发起方监听接收方的回复流
       call.on('stream', (remote: MediaStream) => {
+        console.log('Caller received remote stream from callee answer');
         setRemoteStream(remote);
       });
+
       call.on('close', endCall);
-      call.on('error', endCall);
+      call.on('error', (err: any) => {
+        console.error('Call error during initiation:', err);
+        endCall();
+      });
     } catch (err) {
-      alert('Camera access denied');
+      console.error('Media access failed:', err);
+      alert('Could not access camera/microphone. Please check permissions.');
     }
   };
 
   const answerCall = async () => {
     if (!callRef.current) return;
     try {
+      console.log('Answering incoming call...');
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
       setIsIncomingCall(false);
+      
+      // 关键：应答并发送接收方的流
       callRef.current.answer(stream);
+      console.log('Answer sent with local stream');
     } catch (err) {
-      console.error(err);
+      console.error('Failed to answer call:', err);
       endCall();
     }
   };
 
   const endCall = () => {
+    console.log('Cleaning up call resources...');
     if (callRef.current) {
       callRef.current.close();
       callRef.current = null;
     }
     if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
+      localStream.getTracks().forEach(track => {
+        track.stop();
+        console.log('Stopped local track:', track.kind);
+      });
     }
     setLocalStream(null);
     setRemoteStream(null);
@@ -244,7 +250,6 @@ const App: React.FC = () => {
     );
   }
 
-  // Welcome / ID Screen
   if (status === ConnectionStatus.DISCONNECTED && messages.length === 0 && !activeTargetId) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-white safe-top safe-bottom animate-in fade-in duration-700">
@@ -258,7 +263,6 @@ const App: React.FC = () => {
           </div>
 
           <div className="space-y-8">
-            {/* My ID Card */}
             <div className="bg-gray-50 rounded-[24px] p-6 border border-gray-100 relative group">
               <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] mb-4">Your Sharing ID</p>
               <div className="flex items-center justify-between bg-white rounded-2xl p-4 border border-gray-100 shadow-sm transition-all group-hover:shadow-md group-hover:-translate-y-1">
@@ -275,7 +279,6 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            {/* Target ID Input */}
             <div className="space-y-4">
               <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] px-1">Connect to Peer</p>
               <div className="relative group">
