@@ -2,12 +2,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ChatInterface from './components/ChatInterface';
 import VideoCallOverlay from './components/VideoCallOverlay';
-import { ChatMessage, ConnectionStatus, MessageType } from './types';
+import { ChatMessage, ConnectionStatus, MessageType, LogEntry } from './types';
 import { v4 as uuidv4 } from 'uuid';
 
-const generateShortId = () => {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-};
+const CHUNK_SIZE = 16384;
 
 const App: React.FC = () => {
   const [myId, setMyId] = useState<string>('');
@@ -15,7 +13,8 @@ const App: React.FC = () => {
   const [activeTargetId, setActiveTargetId] = useState<string>('');
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [copied, setCopied] = useState(false);
+  const [transferProgress, setTransferProgress] = useState<Record<string, number>>({});
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   
   const [isInCall, setIsInCall] = useState(false);
   const [isIncomingCall, setIsIncomingCall] = useState(false);
@@ -25,222 +24,310 @@ const App: React.FC = () => {
   const peerRef = useRef<any>(null);
   const connRef = useRef<any>(null);
   const callRef = useRef<any>(null);
-  const heartbeatIntervalRef = useRef<any>(null);
+  const incomingChunks = useRef<Record<string, { chunks: any[], total: number }>>({});
+
+  const addLog = (message: string, level: LogEntry['level'] = 'info') => {
+    const newLog: LogEntry = {
+      id: uuidv4(),
+      time: new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      message,
+      level
+    };
+    setLogs(prev => [newLog, ...prev].slice(0, 50));
+    console.log(`[${level.toUpperCase()}] ${message}`);
+  };
 
   useEffect(() => {
-    const peerId = generateShortId();
+    const peerId = Math.random().toString(36).substring(2, 8).toUpperCase();
     setMyId(peerId);
 
-    const initPeer = () => {
-      const Peer = (window as any).Peer;
-      if (!Peer) return;
+    const Peer = (window as any).Peer;
+    if (!Peer) {
+      addLog("PeerJS library missing!", "error");
+      return;
+    }
 
-      const newPeer = new Peer(peerId, {
-        debug: 1,
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' },
-            { urls: 'stun:stun3.l.google.com:19302' },
-            { urls: 'stun:stun.anyfirewall.com:3478' },
-            { urls: 'stun:stun.voip.blackberry.com:3478' }
-          ],
-          iceCandidatePoolSize: 10,
-        }
-      });
-
-      newPeer.on('connection', (conn: any) => {
-        console.log('Incoming connection:', conn.peer);
-        setActiveTargetId(conn.peer);
-        setupConnection(conn);
-      });
-
-      newPeer.on('call', (call: any) => {
-        console.log('Incoming call from:', call.peer);
-        callRef.current = call;
-        setActiveTargetId(call.peer);
-        setIsIncomingCall(true);
-        setIsInCall(true);
-
-        call.on('stream', (remote: MediaStream) => {
-          console.log('Received remote stream (callee)');
-          setRemoteStream(remote);
-        });
-
-        call.on('close', endCall);
-        call.on('error', endCall);
-      });
-
-      newPeer.on('error', (err: any) => {
-        console.error('Peer error:', err.type, err);
-        if (err.type === 'peer-unavailable' || err.type === 'disconnected') {
-          setStatus(ConnectionStatus.ERROR);
-        }
-      });
-
-      peerRef.current = newPeer;
-    };
-
-    initPeer();
-
-    return () => {
-      stopHeartbeat();
-      peerRef.current?.destroy();
-    };
-  }, []);
-
-  const startHeartbeat = () => {
-    stopHeartbeat();
-    heartbeatIntervalRef.current = setInterval(() => {
-      if (connRef.current && connRef.current.open) {
-        connRef.current.send({ type: 'HEARTBEAT', timestamp: Date.now() });
+    addLog("Initializing Peer system...", "info");
+    const newPeer = new Peer(peerId, {
+      debug: 1,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun.anyfirewall.com:3478' }
+        ]
       }
-    }, 15000);
-  };
-
-  const stopHeartbeat = () => {
-    if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
-  };
-
-  const setupConnection = (conn: any) => {
-    if (connRef.current) connRef.current.close();
-    
-    connRef.current = conn;
-    
-    conn.on('open', () => {
-      console.log('Data channel open with:', conn.peer);
-      setStatus(ConnectionStatus.CONNECTED);
-      startHeartbeat();
     });
 
-    conn.on('data', (data: any) => {
-      if (data.type === 'HEARTBEAT') return;
-      setMessages((prev) => [...prev, data as ChatMessage]);
+    newPeer.on('open', (id: string) => {
+      addLog(`Signaling server connected. My ID: ${id}`, "success");
+    });
+
+    newPeer.on('connection', (conn: any) => {
+      addLog(`Incoming link request from ${conn.peer}`, "info");
+      setActiveTargetId(conn.peer);
+      setupDataConnection(conn);
+    });
+
+    newPeer.on('call', (call: any) => {
+      addLog(`Incoming call verified from ${call.peer}`, "success");
+      callRef.current = call;
+      call.on('stream', (remote: MediaStream) => {
+        addLog("Remote media stream received", "success");
+        setRemoteStream(remote);
+      });
+      call.on('close', () => {
+        addLog("Call ended by remote", "warn");
+        endCall();
+      });
+      call.on('error', (err: any) => {
+        addLog(`Call error: ${err.type}`, "error");
+        endCall();
+      });
+    });
+
+    newPeer.on('error', (err: any) => {
+      addLog(`Peer system error: ${err.type}`, "error");
+      if (err.type === 'peer-unavailable') {
+        addLog("Peer not found. Check if the ID is correct.", "warn");
+        setStatus(ConnectionStatus.ERROR);
+      }
+    });
+
+    peerRef.current = newPeer;
+    return () => newPeer.destroy();
+  }, []);
+
+  const setupDataConnection = (conn: any) => {
+    connRef.current = conn;
+    addLog(`Negotiating data channel with ${conn.peer}...`, "info");
+
+    conn.on('open', () => {
+      addLog("P2P Data Channel established successfully", "success");
+      setStatus(ConnectionStatus.CONNECTED);
     });
 
     conn.on('close', () => {
-      console.log('Connection closed');
+      addLog("P2P Link disconnected", "warn");
       setStatus(ConnectionStatus.DISCONNECTED);
-      stopHeartbeat();
     });
 
     conn.on('error', (err: any) => {
-      console.error('Conn error:', err);
+      addLog(`Data channel error: ${err}`, "error");
       setStatus(ConnectionStatus.ERROR);
     });
-  };
-
-  const connectToPeer = (manualId?: string) => {
-    const idToConnect = manualId || targetIdInput.trim().toUpperCase();
-    if (!idToConnect || !peerRef.current) return;
     
-    setActiveTargetId(idToConnect);
-    setStatus(ConnectionStatus.CONNECTING);
-    
-    const conn = peerRef.current.connect(idToConnect, { 
-      reliable: true,
-      metadata: { initiatorId: myId }
+    conn.on('data', (data: ChatMessage) => {
+      if (data.type === MessageType.CHUNK) {
+        handleIncomingChunk(data);
+      } else if (data.type === MessageType.CALL_REQUEST) {
+        addLog("Call negotiation request received", "info");
+        setActiveTargetId(data.senderId);
+        setIsIncomingCall(true);
+        setIsInCall(true);
+      } else if (data.type === MessageType.CALL_RESPONSE) {
+        addLog(`Call response: ${data.content}`, "info");
+        if (data.content === 'ACCEPT') {
+          addLog("Peer accepted call, initiating WebRTC media sync...", "info");
+          initiateWebRTCCall();
+        } else {
+          addLog("Peer rejected the call", "warn");
+          endCall();
+        }
+      } else {
+        setMessages(prev => [...prev, data]);
+      }
     });
-    
-    setupConnection(conn);
   };
 
-  const sendMessage = (content: any, type: MessageType = MessageType.TEXT, fileName?: string) => {
-    if (!connRef.current || !connRef.current.open) return;
+  const handleIncomingChunk = (msg: ChatMessage) => {
+    const tId = msg.transferId!;
+    if (!incomingChunks.current[tId]) {
+      addLog(`Starting file transfer: ${msg.fileName}`, "info");
+      incomingChunks.current[tId] = { chunks: [], total: msg.totalChunks! };
+    }
+    
+    incomingChunks.current[tId].chunks[msg.chunkIndex!] = msg.content;
+    const received = Object.keys(incomingChunks.current[tId].chunks).length;
+    const progress = Math.floor((received / msg.totalChunks!) * 100);
+    setTransferProgress(prev => ({ ...prev, [tId]: progress }));
 
-    const msg: ChatMessage = {
-      id: uuidv4(),
-      senderId: myId, 
-      type,
-      content,
-      timestamp: Date.now(),
-      fileName
-    };
-
-    try {
-      connRef.current.send(msg);
-      setMessages((prev) => [...prev, msg]);
-    } catch (e) {
-      console.error("Send failed:", e);
+    if (received === msg.totalChunks) {
+      addLog(`Transfer complete: ${msg.fileName}`, "success");
+      const blob = new Blob(incomingChunks.current[tId].chunks);
+      const finalMsg: ChatMessage = {
+        ...msg,
+        type: msg.fileName?.match(/\.(jpg|jpeg|png|gif)$/i) ? MessageType.IMAGE : MessageType.VIDEO_FILE,
+        content: blob
+      };
+      setMessages(prev => [...prev, finalMsg]);
+      delete incomingChunks.current[tId];
+      setTransferProgress(prev => {
+        const n = { ...prev };
+        delete n[tId];
+        return n;
+      });
     }
   };
 
-  const startCall = async () => {
-    if (!activeTargetId || !peerRef.current) return;
+  const connectToPeer = () => {
+    const id = targetIdInput.trim().toUpperCase();
+    if (!id || !peerRef.current) return;
+    
+    addLog(`Initiating connection to ${id}...`, "info");
+    setActiveTargetId(id);
+    setStatus(ConnectionStatus.CONNECTING);
+    
+    const conn = peerRef.current.connect(id, { 
+      reliable: true,
+      serialization: 'binary' // 强制二进制确保兼容性
+    });
+    setupDataConnection(conn);
+  };
+
+  const sendFile = async (file: File) => {
+    if (!connRef.current) return;
+    const transferId = uuidv4();
+    const arrayBuffer = await file.arrayBuffer();
+    const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
+
+    addLog(`Preparing file: ${file.name} (${totalChunks} chunks)`, "info");
+
+    const previewMsg: ChatMessage = {
+      id: uuidv4(),
+      senderId: myId,
+      type: MessageType.SYSTEM,
+      content: `Sending: ${file.name}`,
+      timestamp: Date.now(),
+      transferId
+    };
+    setMessages(prev => [...prev, previewMsg]);
+
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, arrayBuffer.byteLength);
+      const chunk = arrayBuffer.slice(start, end);
+
+      const chunkMsg: ChatMessage = {
+        id: uuidv4(),
+        senderId: myId,
+        type: MessageType.CHUNK,
+        content: chunk,
+        timestamp: Date.now(),
+        transferId,
+        chunkIndex: i,
+        totalChunks,
+        fileName: file.name
+      };
+
+      connRef.current.send(chunkMsg);
+      
+      if (i % 10 === 0 || i === totalChunks - 1) {
+        setTransferProgress(prev => ({ ...prev, [transferId]: Math.floor((i / totalChunks) * 100) }));
+        await new Promise(r => setTimeout(r, 20)); // 给流留点空间
+      }
+    }
+    
+    setMessages(prev => [...prev, {
+      id: transferId,
+      senderId: myId,
+      type: file.type.startsWith('image/') ? MessageType.IMAGE : MessageType.VIDEO_FILE,
+      content: file,
+      timestamp: Date.now(),
+      fileName: file.name
+    }]);
+    setTransferProgress(prev => {
+      const n = { ...prev };
+      delete n[transferId];
+      return n;
+    });
+  };
+
+  const startCallNegotiation = () => {
+    if (!connRef.current) return;
+    addLog("Sending call request to peer...", "info");
+    setIsInCall(true);
+    setIsIncomingCall(false);
+    connRef.current.send({
+      id: uuidv4(),
+      senderId: myId,
+      type: MessageType.CALL_REQUEST,
+      content: null,
+      timestamp: Date.now()
+    });
+  };
+
+  const acceptCallNegotiation = async () => {
     try {
-      console.log('Requesting media for outgoing call...');
+      addLog("Accessing media devices...", "info");
       const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, 
+        video: { facingMode: 'user', width: 640, height: 480 }, 
         audio: true 
       });
-      
+      addLog("Local media devices ready", "success");
       setLocalStream(stream);
-      setIsInCall(true);
-
-      const call = peerRef.current.call(activeTargetId, stream);
-      callRef.current = call;
-
-      call.on('stream', (remote: MediaStream) => {
-        console.log('Received remote stream (caller)');
-        setRemoteStream(remote);
+      setIsIncomingCall(false);
+      connRef.current.send({
+        id: uuidv4(),
+        senderId: myId,
+        type: MessageType.CALL_RESPONSE,
+        content: 'ACCEPT',
+        timestamp: Date.now()
       });
-
-      call.on('close', endCall);
-      call.on('error', endCall);
-    } catch (err) {
-      console.error('Call failed:', err);
-      alert('Camera access denied or device busy');
+    } catch (e) {
+      addLog("Media access failed: " + e, "error");
+      alert('Camera access denied');
       endCall();
     }
   };
 
-  const answerCall = async () => {
-    if (!callRef.current) return;
+  const initiateWebRTCCall = async () => {
     try {
-      console.log('Requesting media for answering call...');
+      addLog("Accessing media devices for caller...", "info");
       const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, 
+        video: { facingMode: 'user', width: 640, height: 480 }, 
         audio: true 
       });
-      
+      addLog("Caller media devices ready", "success");
       setLocalStream(stream);
-      setIsIncomingCall(false);
-      callRef.current.answer(stream);
-      console.log('Call answered with local stream');
-    } catch (err) {
-      console.error('Answer failed:', err);
-      alert('Could not start camera for call');
+      const call = peerRef.current.call(activeTargetId, stream);
+      callRef.current = call;
+      addLog("WebRTC Media Connection handshake started", "info");
+      call.on('stream', (remote: MediaStream) => {
+        addLog("Remote stream received by caller", "success");
+        setRemoteStream(remote);
+      });
+      call.on('close', endCall);
+      call.on('error', (err: any) => {
+        addLog(`Call error (caller side): ${err.type}`, "error");
+        endCall();
+      });
+    } catch (e) {
+      addLog("Media access failed: " + e, "error");
       endCall();
     }
   };
 
   const endCall = () => {
-    if (callRef.current) {
-      callRef.current.close();
-      callRef.current = null;
-    }
-    if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
-    }
+    if (callRef.current) callRef.current.close();
+    if (localStream) localStream.getTracks().forEach(t => t.stop());
     setLocalStream(null);
     setRemoteStream(null);
     setIsInCall(false);
     setIsIncomingCall(false);
+    addLog("Call cleanup complete", "info");
   };
 
-  const handleLogout = () => {
-    if(connRef.current) connRef.current.close();
-    setMessages([]);
-    setActiveTargetId('');
-    setStatus(ConnectionStatus.DISCONNECTED);
-    endCall();
-  };
-
-  const copyMyId = () => {
-    navigator.clipboard.writeText(myId);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const sendMessage = (content: any, type: MessageType = MessageType.TEXT) => {
+    if (type === MessageType.TEXT) {
+      if (!content.trim()) return;
+      const msg = { id: uuidv4(), senderId: myId, type, content, timestamp: Date.now() };
+      connRef.current?.send(msg);
+      setMessages(prev => [...prev, msg]);
+    } else {
+      sendFile(content);
+    }
   };
 
   if (isInCall) {
@@ -250,61 +337,70 @@ const App: React.FC = () => {
         remoteStream={remoteStream}
         onEndCall={endCall}
         isIncoming={isIncomingCall}
-        onAnswer={answerCall}
+        onAnswer={acceptCallNegotiation}
         remotePeerId={activeTargetId}
       />
     );
   }
 
+  // Initial State / Login Screen
   if (status === ConnectionStatus.DISCONNECTED && messages.length === 0 && !activeTargetId) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-white safe-top safe-bottom">
-        <div className="w-full max-w-sm space-y-12">
-          <div className="text-center space-y-3">
-            <div className="w-24 h-24 bg-gradient-to-br from-blue-600 to-indigo-700 rounded-[28px] flex items-center justify-center mx-auto shadow-2xl shadow-blue-200 mb-8 rotate-3 transition-transform hover:rotate-0 duration-500">
-              <i className="ph-fill ph-broadcast text-5xl text-white"></i>
+      <div className="flex flex-col h-screen bg-gray-50 safe-top safe-bottom">
+        <div className="flex-1 flex flex-col items-center justify-center p-8">
+          <div className="w-full max-w-sm space-y-8 animate-in fade-in duration-700">
+            <div className="text-center">
+              <div className="w-20 h-20 bg-blue-600 rounded-[28px] mx-auto flex items-center justify-center text-white text-4xl font-black shadow-2xl shadow-blue-200 mb-6 rotate-3">
+                <i className="ph-fill ph-link"></i>
+              </div>
+              <h1 className="text-3xl font-black text-gray-900 mb-2">P2P Link</h1>
+              <p className="text-gray-400 font-medium">Serverless private communication</p>
             </div>
-            <h1 className="text-4xl font-black text-gray-900 tracking-tight">P2P Link</h1>
-            <p className="text-gray-400 font-medium text-lg">Fast, private, serverless.</p>
-          </div>
 
-          <div className="space-y-8">
-            <div className="bg-gray-50 rounded-[24px] p-6 border border-gray-100 relative group">
-              <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] mb-4">Your Sharing ID</p>
-              <div className="flex items-center justify-between bg-white rounded-2xl p-4 border border-gray-100 shadow-sm transition-all group-hover:shadow-md">
-                <span className="text-3xl font-mono font-black text-blue-600 tracking-wider">{myId || '......'}</span>
-                <button 
-                  onClick={copyMyId}
-                  className={`p-3 rounded-xl transition-all flex items-center gap-2 ${
-                    copied ? 'bg-green-50 text-green-600' : 'bg-gray-50 text-gray-400 hover:text-blue-600 active:scale-90'
-                  }`}
-                >
-                  <i className={`ph-bold ${copied ? 'ph-check' : 'ph-copy'} text-xl`}></i>
-                  {copied && <span className="text-xs font-bold uppercase">Copied</span>}
-                </button>
+            <div className="bg-white p-6 rounded-[32px] border border-gray-100 shadow-sm">
+              <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3 text-center">My Sharing ID</p>
+              <div className="bg-gray-50 p-4 rounded-2xl flex items-center justify-center">
+                <span className="text-3xl font-mono font-black text-blue-600 tracking-tighter">{myId || '---'}</span>
               </div>
             </div>
 
             <div className="space-y-4">
-              <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] px-1">Connect to Peer</p>
-              <div className="relative group">
-                <input 
-                  type="text"
-                  placeholder="FRIEND'S ID"
-                  value={targetIdInput}
-                  onChange={(e) => setTargetIdInput(e.target.value.toUpperCase())}
-                  className="w-full bg-gray-50 border-2 border-transparent rounded-[24px] p-5 pl-14 text-xl font-black placeholder:text-gray-200 focus:bg-white focus:border-blue-500 transition-all uppercase tracking-widest"
-                />
-                <i className="ph-bold ph-user-focus absolute left-5 top-1/2 -translate-y-1/2 text-gray-300 text-2xl transition-colors group-focus-within:text-blue-500"></i>
-              </div>
-              <button 
-                disabled={!targetIdInput}
-                onClick={() => connectToPeer()}
-                className="w-full py-5 rounded-[24px] bg-gray-900 text-white font-black text-lg shadow-2xl shadow-gray-200 active:scale-95 hover:bg-black transition-all disabled:bg-gray-100 disabled:text-gray-300 disabled:shadow-none mt-2"
-              >
-                Join Channel
-              </button>
+               <input 
+                 value={targetIdInput} 
+                 onChange={e => setTargetIdInput(e.target.value.toUpperCase())} 
+                 placeholder="FRIEND ID"
+                 className="w-full p-5 rounded-[24px] bg-white border border-gray-100 shadow-sm focus:border-blue-500 focus:ring-4 focus:ring-blue-50 outline-none text-center font-bold text-xl transition-all"
+               />
+               <button 
+                 onClick={connectToPeer} 
+                 className="w-full p-5 rounded-[24px] bg-gray-900 text-white font-black text-lg hover:bg-black transition-all active:scale-95 shadow-xl"
+               >
+                 Connect Now
+               </button>
             </div>
+          </div>
+        </div>
+
+        {/* Diagnostic Logs for connection phase */}
+        <div className="h-48 bg-gray-900 p-4 overflow-y-auto no-scrollbar rounded-t-[32px] border-t border-gray-800">
+          <p className="text-[9px] font-black text-gray-500 uppercase tracking-widest mb-3 flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
+            System Diagnostics
+          </p>
+          <div className="space-y-2">
+            {logs.map(log => (
+              <div key={log.id} className="flex gap-3 text-[11px] font-mono leading-relaxed">
+                <span className="text-gray-600 shrink-0">{log.time}</span>
+                <span className={`${
+                  log.level === 'error' ? 'text-red-400' : 
+                  log.level === 'success' ? 'text-green-400' : 
+                  log.level === 'warn' ? 'text-yellow-400' : 'text-gray-400'
+                }`}>
+                  {log.message}
+                </span>
+              </div>
+            ))}
+            {logs.length === 0 && <p className="text-gray-700 italic">Waiting for connection attempt...</p>}
           </div>
         </div>
       </div>
@@ -312,23 +408,35 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="h-full relative bg-white">
-      {(status !== ConnectionStatus.CONNECTED && messages.length === 0) && (
-        <div className="absolute inset-0 z-30 bg-white flex flex-col items-center justify-center p-8 text-center animate-in fade-in duration-500">
-           <div className="relative mb-10">
-              <div className="w-32 h-32 bg-blue-50 rounded-full flex items-center justify-center scale-110">
-                <span className="text-5xl font-black text-blue-600">{activeTargetId ? activeTargetId[0] : '?'}</span>
+    <div className="h-screen bg-white relative">
+      {status !== ConnectionStatus.CONNECTED && (
+        <div className="absolute inset-0 z-50 bg-white/95 backdrop-blur-md flex flex-col items-center justify-center p-8 animate-in fade-in duration-300">
+          <div className="w-full max-w-sm flex flex-col items-center gap-8">
+            <div className="relative">
+              <div className="w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center">
+                <i className="ph-fill ph-lightning text-4xl text-blue-600 animate-pulse"></i>
               </div>
-              <div className="absolute -inset-4 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-           </div>
-           <h2 className="text-3xl font-black text-gray-900 mb-3">Connecting</h2>
-           <p className="text-gray-400 font-bold text-lg mb-12">Negotiating P2P channel with <span className="text-blue-600">{activeTargetId}</span>...</p>
-           <button 
-             onClick={handleLogout}
-             className="px-12 py-4 rounded-2xl border-2 border-gray-100 text-gray-400 font-black uppercase tracking-widest hover:bg-red-50 hover:text-red-500 transition-all"
-           >
-             Cancel Link
-           </button>
+              <div className="absolute inset-0 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+            </div>
+            
+            <div className="text-center">
+              <h2 className="text-2xl font-black text-gray-900 mb-1 tracking-tight">Establishing Link</h2>
+              <p className="text-gray-400 font-bold">Negotiating P2P with <span className="text-blue-600">{activeTargetId}</span></p>
+            </div>
+
+            <div className="w-full bg-gray-50 p-4 rounded-3xl border border-gray-100 max-h-40 overflow-y-auto no-scrollbar font-mono text-[10px] space-y-1">
+              {logs.slice(0, 10).map(log => (
+                <div key={log.id} className={`flex gap-2 ${log.level === 'error' ? 'text-red-500' : log.level === 'success' ? 'text-green-600' : 'text-gray-500'}`}>
+                  <span>[{log.time}]</span>
+                  <span>{log.message}</span>
+                </div>
+              ))}
+            </div>
+
+            <button onClick={() => window.location.reload()} className="text-red-500 font-black text-xs uppercase tracking-widest px-8 py-3 rounded-full hover:bg-red-50 transition">
+              Abort Connection
+            </button>
+          </div>
         </div>
       )}
 
@@ -336,11 +444,13 @@ const App: React.FC = () => {
         messages={messages}
         myId={myId}
         onSendMessage={sendMessage}
-        onStartCall={startCall}
+        onStartCall={startCallNegotiation}
         remotePeerId={activeTargetId}
-        onDisconnect={handleLogout}
+        onDisconnect={() => window.location.reload()}
         status={status}
-        onReconnect={() => connectToPeer(activeTargetId)}
+        onReconnect={connectToPeer}
+        transferProgress={transferProgress}
+        logs={logs}
       />
     </div>
   );

@@ -1,24 +1,12 @@
 
-// PeerJS types are loaded via global script, but we define interfaces for safety
-export interface PeerJS {
-  new (id?: string, options?: any): any;
-  on(event: string, callback: (data: any) => void): void;
-  connect(id: string): any;
-  call(id: string, stream: MediaStream): any;
-  destroy(): void;
-  id: string;
-}
-
-declare global {
-  interface Window {
-    Peer: any;
-  }
-}
-
 export enum MessageType {
   TEXT = 'TEXT',
   IMAGE = 'IMAGE',
   VIDEO_FILE = 'VIDEO_FILE',
+  CHUNK = 'CHUNK', 
+  CHUNK_END = 'CHUNK_END', 
+  CALL_REQUEST = 'CALL_REQUEST', 
+  CALL_RESPONSE = 'CALL_RESPONSE', 
   SYSTEM = 'SYSTEM'
 }
 
@@ -26,9 +14,12 @@ export interface ChatMessage {
   id: string;
   senderId: string;
   type: MessageType;
-  content: any; // 更改为 any，支持 string 或 Blob
+  content: any;
   timestamp: number;
   fileName?: string;
+  totalChunks?: number;
+  chunkIndex?: number;
+  transferId?: string;
 }
 
 export enum ConnectionStatus {
@@ -36,4 +27,11 @@ export enum ConnectionStatus {
   CONNECTING = 'CONNECTING',
   CONNECTED = 'CONNECTED',
   ERROR = 'ERROR'
+}
+
+export interface LogEntry {
+  id: string;
+  time: string;
+  message: string;
+  level: 'info' | 'warn' | 'error' | 'success';
 }
