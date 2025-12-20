@@ -15,6 +15,7 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [transferProgress, setTransferProgress] = useState<Record<string, number>>({});
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [copied, setCopied] = useState(false);
   
   const [isInCall, setIsInCall] = useState(false);
   const [isIncomingCall, setIsIncomingCall] = useState(false);
@@ -25,6 +26,7 @@ const App: React.FC = () => {
   const connRef = useRef<any>(null);
   const callRef = useRef<any>(null);
   const incomingChunks = useRef<Record<string, { chunks: any[], total: number }>>({});
+  const connectionTimeoutRef = useRef<any>(null);
 
   const addLog = (message: string, level: LogEntry['level'] = 'info') => {
     const newLog: LogEntry = {
@@ -34,7 +36,6 @@ const App: React.FC = () => {
       level
     };
     setLogs(prev => [newLog, ...prev].slice(0, 50));
-    console.log(`[${level.toUpperCase()}] ${message}`);
   };
 
   useEffect(() => {
@@ -55,8 +56,10 @@ const App: React.FC = () => {
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
           { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'stun:stun.anyfirewall.com:3478' }
-        ]
+          { urls: 'stun:stun.anyfirewall.com:3478' },
+          { urls: 'stun:stun.voip.blackberry.com:3478' }
+        ],
+        iceCandidatePoolSize: 10,
       }
     });
 
@@ -77,10 +80,7 @@ const App: React.FC = () => {
         addLog("Remote media stream received", "success");
         setRemoteStream(remote);
       });
-      call.on('close', () => {
-        addLog("Call ended by remote", "warn");
-        endCall();
-      });
+      call.on('close', endCall);
       call.on('error', (err: any) => {
         addLog(`Call error: ${err.type}`, "error");
         endCall();
@@ -90,20 +90,29 @@ const App: React.FC = () => {
     newPeer.on('error', (err: any) => {
       addLog(`Peer system error: ${err.type}`, "error");
       if (err.type === 'peer-unavailable') {
-        addLog("Peer not found. Check if the ID is correct.", "warn");
+        addLog("Target Peer not found. Verify ID.", "warn");
         setStatus(ConnectionStatus.ERROR);
+      }
+      if (err.type === 'network') {
+        addLog("Network error. Check your connection.", "error");
       }
     });
 
     peerRef.current = newPeer;
-    return () => newPeer.destroy();
+    return () => {
+      newPeer.destroy();
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+    };
   }, []);
 
   const setupDataConnection = (conn: any) => {
+    if (connRef.current) connRef.current.close();
     connRef.current = conn;
+    
     addLog(`Negotiating data channel with ${conn.peer}...`, "info");
 
     conn.on('open', () => {
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
       addLog("P2P Data Channel established successfully", "success");
       setStatus(ConnectionStatus.CONNECTED);
     });
@@ -114,11 +123,14 @@ const App: React.FC = () => {
     });
 
     conn.on('error', (err: any) => {
-      addLog(`Data channel error: ${err}`, "error");
+      addLog(`Data channel error: ${err.type || err}`, "error");
       setStatus(ConnectionStatus.ERROR);
     });
     
-    conn.on('data', (data: ChatMessage) => {
+    conn.on('data', (data: any) => {
+      // Handle non-chat message objects (like heartbeats or raw PeerJS events)
+      if (!data || typeof data !== 'object') return;
+
       if (data.type === MessageType.CHUNK) {
         handleIncomingChunk(data);
       } else if (data.type === MessageType.CALL_REQUEST) {
@@ -129,14 +141,12 @@ const App: React.FC = () => {
       } else if (data.type === MessageType.CALL_RESPONSE) {
         addLog(`Call response: ${data.content}`, "info");
         if (data.content === 'ACCEPT') {
-          addLog("Peer accepted call, initiating WebRTC media sync...", "info");
           initiateWebRTCCall();
         } else {
-          addLog("Peer rejected the call", "warn");
           endCall();
         }
-      } else {
-        setMessages(prev => [...prev, data]);
+      } else if (data.type) {
+        setMessages(prev => [...prev, data as ChatMessage]);
       }
     });
   };
@@ -178,16 +188,39 @@ const App: React.FC = () => {
     addLog(`Initiating connection to ${id}...`, "info");
     setActiveTargetId(id);
     setStatus(ConnectionStatus.CONNECTING);
+
+    // Set a timeout for connection attempt
+    if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+    connectionTimeoutRef.current = setTimeout(() => {
+      if (status !== ConnectionStatus.CONNECTED) {
+        addLog("Connection timeout. Peer might be offline or blocked by firewall.", "error");
+        setStatus(ConnectionStatus.ERROR);
+      }
+    }, 15000);
     
+    // Serialization 'json' is often more reliable than 'binary' across different browsers for basic objects
     const conn = peerRef.current.connect(id, { 
       reliable: true,
-      serialization: 'binary' // 强制二进制确保兼容性
+      serialization: 'json'
     });
     setupDataConnection(conn);
   };
 
+  const copyMyId = () => {
+    if (!myId) return;
+    navigator.clipboard.writeText(myId).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(err => {
+      addLog("Failed to copy ID: " + err, "error");
+    });
+  };
+
   const sendFile = async (file: File) => {
-    if (!connRef.current) return;
+    if (!connRef.current || !connRef.current.open) {
+      addLog("Cannot send file: Connection not open", "error");
+      return;
+    }
     const transferId = uuidv4();
     const arrayBuffer = await file.arrayBuffer();
     const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
@@ -221,11 +254,16 @@ const App: React.FC = () => {
         fileName: file.name
       };
 
-      connRef.current.send(chunkMsg);
+      try {
+        connRef.current.send(chunkMsg);
+      } catch (e) {
+        addLog("Data channel interrupted during transfer", "error");
+        break;
+      }
       
       if (i % 10 === 0 || i === totalChunks - 1) {
         setTransferProgress(prev => ({ ...prev, [transferId]: Math.floor((i / totalChunks) * 100) }));
-        await new Promise(r => setTimeout(r, 20)); // 给流留点空间
+        await new Promise(r => setTimeout(r, 30)); // Slightly longer delay for stability
       }
     }
     
@@ -246,7 +284,7 @@ const App: React.FC = () => {
 
   const startCallNegotiation = () => {
     if (!connRef.current) return;
-    addLog("Sending call request to peer...", "info");
+    addLog("Sending call request...", "info");
     setIsInCall(true);
     setIsIncomingCall(false);
     connRef.current.send({
@@ -260,12 +298,10 @@ const App: React.FC = () => {
 
   const acceptCallNegotiation = async () => {
     try {
-      addLog("Accessing media devices...", "info");
       const stream = await navigator.mediaDevices.getUserMedia({ 
         video: { facingMode: 'user', width: 640, height: 480 }, 
         audio: true 
       });
-      addLog("Local media devices ready", "success");
       setLocalStream(stream);
       setIsIncomingCall(false);
       connRef.current.send({
@@ -284,23 +320,17 @@ const App: React.FC = () => {
 
   const initiateWebRTCCall = async () => {
     try {
-      addLog("Accessing media devices for caller...", "info");
       const stream = await navigator.mediaDevices.getUserMedia({ 
         video: { facingMode: 'user', width: 640, height: 480 }, 
         audio: true 
       });
-      addLog("Caller media devices ready", "success");
       setLocalStream(stream);
       const call = peerRef.current.call(activeTargetId, stream);
       callRef.current = call;
-      addLog("WebRTC Media Connection handshake started", "info");
-      call.on('stream', (remote: MediaStream) => {
-        addLog("Remote stream received by caller", "success");
-        setRemoteStream(remote);
-      });
+      call.on('stream', (remote: MediaStream) => setRemoteStream(remote));
       call.on('close', endCall);
       call.on('error', (err: any) => {
-        addLog(`Call error (caller side): ${err.type}`, "error");
+        addLog(`Call error: ${err.type}`, "error");
         endCall();
       });
     } catch (e) {
@@ -316,7 +346,7 @@ const App: React.FC = () => {
     setRemoteStream(null);
     setIsInCall(false);
     setIsIncomingCall(false);
-    addLog("Call cleanup complete", "info");
+    addLog("Call ended", "info");
   };
 
   const sendMessage = (content: any, type: MessageType = MessageType.TEXT) => {
@@ -346,34 +376,47 @@ const App: React.FC = () => {
   // Initial State / Login Screen
   if (status === ConnectionStatus.DISCONNECTED && messages.length === 0 && !activeTargetId) {
     return (
-      <div className="flex flex-col h-screen bg-gray-50 safe-top safe-bottom">
+      <div className="flex flex-col h-screen bg-white safe-top safe-bottom">
         <div className="flex-1 flex flex-col items-center justify-center p-8">
-          <div className="w-full max-w-sm space-y-8 animate-in fade-in duration-700">
+          <div className="w-full max-w-sm space-y-10 animate-in fade-in duration-700">
             <div className="text-center">
               <div className="w-20 h-20 bg-blue-600 rounded-[28px] mx-auto flex items-center justify-center text-white text-4xl font-black shadow-2xl shadow-blue-200 mb-6 rotate-3">
                 <i className="ph-fill ph-link"></i>
               </div>
-              <h1 className="text-3xl font-black text-gray-900 mb-2">P2P Link</h1>
-              <p className="text-gray-400 font-medium">Serverless private communication</p>
+              <h1 className="text-4xl font-black text-gray-900 mb-2 tracking-tight">P2P Link</h1>
+              <p className="text-gray-400 font-medium text-lg">Fast. Private. Serverless.</p>
             </div>
 
-            <div className="bg-white p-6 rounded-[32px] border border-gray-100 shadow-sm">
-              <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3 text-center">My Sharing ID</p>
-              <div className="bg-gray-50 p-4 rounded-2xl flex items-center justify-center">
-                <span className="text-3xl font-mono font-black text-blue-600 tracking-tighter">{myId || '---'}</span>
+            <div className="bg-gray-50 p-7 rounded-[32px] border border-gray-100 shadow-sm relative group">
+              <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] mb-4 text-center">My Sharing ID</p>
+              <div className="flex items-center justify-between bg-white p-4 rounded-2xl border border-gray-200/50 shadow-inner">
+                <span className="text-3xl font-mono font-black text-blue-600 tracking-tighter select-all">{myId || '---'}</span>
+                <button 
+                  onClick={copyMyId}
+                  className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all active:scale-90 ${
+                    copied ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-400 hover:text-blue-600'
+                  }`}
+                >
+                  <i className={`ph-bold ${copied ? 'ph-check' : 'ph-copy'} text-xl`}></i>
+                </button>
               </div>
+              {copied && <p className="absolute -bottom-6 left-1/2 -translate-x-1/2 text-[10px] font-black text-green-500 uppercase tracking-widest animate-in fade-in slide-in-from-top-2">Copied to clipboard</p>}
             </div>
 
-            <div className="space-y-4">
-               <input 
-                 value={targetIdInput} 
-                 onChange={e => setTargetIdInput(e.target.value.toUpperCase())} 
-                 placeholder="FRIEND ID"
-                 className="w-full p-5 rounded-[24px] bg-white border border-gray-100 shadow-sm focus:border-blue-500 focus:ring-4 focus:ring-blue-50 outline-none text-center font-bold text-xl transition-all"
-               />
+            <div className="space-y-4 pt-4">
+               <div className="relative">
+                 <input 
+                   value={targetIdInput} 
+                   onChange={e => setTargetIdInput(e.target.value.toUpperCase())} 
+                   placeholder="FRIEND ID"
+                   className="w-full p-5 rounded-[24px] bg-white border-2 border-gray-100 shadow-sm focus:border-blue-500 focus:ring-4 focus:ring-blue-50 outline-none text-center font-black text-2xl transition-all placeholder:text-gray-200 placeholder:font-bold tracking-widest"
+                 />
+                 <i className="ph-bold ph-user-focus absolute left-5 top-1/2 -translate-y-1/2 text-gray-300 text-xl"></i>
+               </div>
                <button 
                  onClick={connectToPeer} 
-                 className="w-full p-5 rounded-[24px] bg-gray-900 text-white font-black text-lg hover:bg-black transition-all active:scale-95 shadow-xl"
+                 disabled={!targetIdInput}
+                 className="w-full p-5 rounded-[24px] bg-gray-900 text-white font-black text-xl hover:bg-black transition-all active:scale-95 shadow-2xl shadow-gray-200 disabled:opacity-20 disabled:shadow-none"
                >
                  Connect Now
                </button>
@@ -381,16 +424,18 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Diagnostic Logs for connection phase */}
-        <div className="h-48 bg-gray-900 p-4 overflow-y-auto no-scrollbar rounded-t-[32px] border-t border-gray-800">
-          <p className="text-[9px] font-black text-gray-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
-            System Diagnostics
-          </p>
-          <div className="space-y-2">
+        {/* System Logs at bottom */}
+        <div className="h-44 bg-gray-900 p-5 overflow-y-auto no-scrollbar rounded-t-[40px] border-t border-gray-800 shadow-2xl">
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-[10px] font-black text-gray-500 uppercase tracking-widest flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
+              Console Diagnostics
+            </p>
+          </div>
+          <div className="space-y-2.5 font-mono text-[11px]">
             {logs.map(log => (
-              <div key={log.id} className="flex gap-3 text-[11px] font-mono leading-relaxed">
-                <span className="text-gray-600 shrink-0">{log.time}</span>
+              <div key={log.id} className="flex gap-3 leading-relaxed">
+                <span className="text-gray-600 shrink-0 select-none">[{log.time}]</span>
                 <span className={`${
                   log.level === 'error' ? 'text-red-400' : 
                   log.level === 'success' ? 'text-green-400' : 
@@ -400,7 +445,7 @@ const App: React.FC = () => {
                 </span>
               </div>
             ))}
-            {logs.length === 0 && <p className="text-gray-700 italic">Waiting for connection attempt...</p>}
+            {logs.length === 0 && <p className="text-gray-700 italic">Listening for system events...</p>}
           </div>
         </div>
       </div>
@@ -409,33 +454,44 @@ const App: React.FC = () => {
 
   return (
     <div className="h-screen bg-white relative">
-      {status !== ConnectionStatus.CONNECTED && (
+      {(status === ConnectionStatus.CONNECTING || status === ConnectionStatus.ERROR) && (
         <div className="absolute inset-0 z-50 bg-white/95 backdrop-blur-md flex flex-col items-center justify-center p-8 animate-in fade-in duration-300">
-          <div className="w-full max-w-sm flex flex-col items-center gap-8">
+          <div className="w-full max-w-sm flex flex-col items-center gap-10">
             <div className="relative">
-              <div className="w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center">
-                <i className="ph-fill ph-lightning text-4xl text-blue-600 animate-pulse"></i>
+              <div className={`w-28 h-28 ${status === ConnectionStatus.ERROR ? 'bg-red-50' : 'bg-blue-50'} rounded-full flex items-center justify-center transition-colors duration-500`}>
+                <i className={`ph-fill ${status === ConnectionStatus.ERROR ? 'ph-warning-octagon text-red-500' : 'ph-lightning text-blue-600'} text-5xl animate-pulse`}></i>
               </div>
-              <div className="absolute inset-0 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+              {status !== ConnectionStatus.ERROR && <div className="absolute inset-0 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>}
             </div>
             
             <div className="text-center">
-              <h2 className="text-2xl font-black text-gray-900 mb-1 tracking-tight">Establishing Link</h2>
-              <p className="text-gray-400 font-bold">Negotiating P2P with <span className="text-blue-600">{activeTargetId}</span></p>
+              <h2 className="text-3xl font-black text-gray-900 mb-2 tracking-tight">
+                {status === ConnectionStatus.ERROR ? 'Connection Failed' : 'Establishing Link'}
+              </h2>
+              <p className="text-gray-400 font-bold text-lg">
+                P2P handshake with <span className="text-blue-600">{activeTargetId}</span>
+              </p>
             </div>
 
-            <div className="w-full bg-gray-50 p-4 rounded-3xl border border-gray-100 max-h-40 overflow-y-auto no-scrollbar font-mono text-[10px] space-y-1">
-              {logs.slice(0, 10).map(log => (
-                <div key={log.id} className={`flex gap-2 ${log.level === 'error' ? 'text-red-500' : log.level === 'success' ? 'text-green-600' : 'text-gray-500'}`}>
-                  <span>[{log.time}]</span>
+            <div className="w-full bg-gray-900 p-5 rounded-[32px] border border-gray-800 h-48 overflow-y-auto no-scrollbar font-mono text-[11px] space-y-2 shadow-2xl">
+              {logs.map(log => (
+                <div key={log.id} className={`flex gap-3 ${log.level === 'error' ? 'text-red-400' : log.level === 'success' ? 'text-green-400' : 'text-gray-500'}`}>
+                  <span className="opacity-40">[{log.time}]</span>
                   <span>{log.message}</span>
                 </div>
               ))}
             </div>
 
-            <button onClick={() => window.location.reload()} className="text-red-500 font-black text-xs uppercase tracking-widest px-8 py-3 rounded-full hover:bg-red-50 transition">
-              Abort Connection
-            </button>
+            <div className="flex flex-col w-full gap-4">
+               {status === ConnectionStatus.ERROR && (
+                 <button onClick={connectToPeer} className="w-full py-5 bg-blue-600 text-white font-black rounded-[24px] shadow-xl shadow-blue-100 active:scale-95 transition">
+                    Retry Handshake
+                 </button>
+               )}
+               <button onClick={() => window.location.reload()} className="w-full py-5 bg-gray-100 text-gray-500 font-black rounded-[24px] hover:bg-red-50 hover:text-red-500 transition-all active:scale-95">
+                 Cancel Link
+               </button>
+            </div>
           </div>
         </div>
       )}
