@@ -6,6 +6,7 @@ import { ChatMessage, ConnectionStatus, MessageType, LogEntry } from './types';
 import { v4 as uuidv4 } from 'uuid';
 
 const CHUNK_SIZE = 16384;
+const HANDSHAKE_TIMEOUT = 45000; // 延长至 45 秒
 
 const App: React.FC = () => {
   const [myId, setMyId] = useState<string>('');
@@ -25,6 +26,7 @@ const App: React.FC = () => {
   const peerRef = useRef<any>(null);
   const connRef = useRef<any>(null);
   const callRef = useRef<any>(null);
+  const heartbeatIntervalRef = useRef<any>(null);
   const incomingChunks = useRef<Record<string, { chunks: any[], total: number }>>({});
   const connectionTimeoutRef = useRef<any>(null);
 
@@ -41,10 +43,27 @@ const App: React.FC = () => {
   useEffect(() => {
     initPeer();
     return () => {
+      stopHeartbeat();
       if (peerRef.current) peerRef.current.destroy();
       if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
     };
   }, []);
+
+  const startHeartbeat = () => {
+    stopHeartbeat();
+    heartbeatIntervalRef.current = setInterval(() => {
+      if (peerRef.current && !peerRef.current.disconnected) {
+        // PeerJS 内部会处理信令心跳，此处仅用于监测
+      } else if (peerRef.current?.disconnected) {
+        addLog("Signaling lost, reconnecting...", "warn");
+        peerRef.current.reconnect();
+      }
+    }, 15000);
+  };
+
+  const stopHeartbeat = () => {
+    if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
+  };
 
   const initPeer = () => {
     const peerId = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -52,11 +71,11 @@ const App: React.FC = () => {
 
     const Peer = (window as any).Peer;
     if (!Peer) {
-      addLog("PeerJS library missing!", "error");
+      addLog("Critical: PeerJS library missing!", "error");
       return;
     }
 
-    addLog("Initializing Peer system...", "info");
+    addLog("Initializing P2P kernel...", "info");
     
     const newPeer = new Peer(peerId, {
       debug: 1,
@@ -64,60 +83,57 @@ const App: React.FC = () => {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'stun:stun3.l.google.com:19302' },
-          { urls: 'stun:stun4.l.google.com:19302' },
-          { urls: 'stun:stun.anyfirewall.com:3478' }
+          { urls: 'stun:stun.anyfirewall.com:3478' },
+          { urls: 'stun:stun.sipgate.net:3478' },
+          { urls: 'stun:global.stun.twilio.com:3478' }
         ],
-        iceCandidatePoolSize: 10,
+        sdpSemantics: 'unified-plan',
       }
     });
 
     newPeer.on('open', (id: string) => {
-      addLog(`Signaling server connected. ID: ${id}`, "success");
+      addLog(`Online. ID: ${id}`, "success");
+      startHeartbeat();
     });
 
-    // 处理数据连接
     newPeer.on('connection', (conn: any) => {
-      addLog(`Incoming data request from ${conn.peer}`, "info");
+      addLog(`Incoming link from ${conn.peer}`, "info");
       setActiveTargetId(conn.peer);
       setupDataConnection(conn);
     });
 
-    // 处理原生视频通话
     newPeer.on('call', (call: any) => {
-      addLog(`Incoming call from ${call.peer}`, "success");
+      addLog(`Incoming call: ${call.peer}`, "success");
       callRef.current = call;
       setActiveTargetId(call.peer);
       setIsInCall(true);
       setIsIncomingCall(true);
 
       call.on('stream', (remote: MediaStream) => {
-        addLog("Remote stream received", "success");
+        addLog("Remote media synchronized", "success");
         setRemoteStream(remote);
       });
-      
-      call.on('close', () => {
-        addLog("Call ended by remote", "info");
-        endCall();
-      });
-
+      call.on('close', endCall);
       call.on('error', (err: any) => {
-        addLog(`Call error: ${err.type}`, "error");
+        addLog(`Call Error: ${err.type}`, "error");
         endCall();
       });
     });
 
     newPeer.on('error', (err: any) => {
-      addLog(`System Error: ${err.type}`, "error");
+      addLog(`System: ${err.type}`, "error");
       if (err.type === 'peer-unavailable') {
-        addLog("Target peer not found. They might have closed the app or ID is incorrect.", "error");
+        addLog("Peer offline or ID invalid. Ask them to stay on the page.", "error");
         setStatus(ConnectionStatus.ERROR);
       }
       if (err.type === 'disconnected') {
-        addLog("Disconnected from signaling server. Attempting reconnect...", "warn");
+        addLog("Link to server lost. Reconnecting...", "warn");
         newPeer.reconnect();
       }
+    });
+
+    newPeer.on('disconnected', () => {
+      addLog("Signaling server disconnected.", "warn");
     });
 
     peerRef.current = newPeer;
@@ -129,21 +145,25 @@ const App: React.FC = () => {
     }
     
     connRef.current = conn;
-    addLog(`Syncing data channel with ${conn.peer}...`, "info");
+    addLog(`Syncing with ${conn.peer}...`, "info");
 
     conn.on('open', () => {
       if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
-      addLog("P2P Data Link established", "success");
+      addLog("Secure link established", "success");
       setStatus(ConnectionStatus.CONNECTED);
     });
 
     conn.on('close', () => {
-      addLog("Data Link disconnected", "warn");
+      addLog("Secure link severed", "warn");
       setStatus(ConnectionStatus.DISCONNECTED);
     });
 
     conn.on('error', (err: any) => {
-      addLog(`Data Error: ${err.type || 'failed'}`, "error");
+      const type = err.type || err.message || 'connection-failed';
+      addLog(`Link Error: ${type}`, "error");
+      if (type === 'negotiation-failed') {
+        addLog("NAT Traversal failed. Try using same Wi-Fi or both use Cellular Data.", "warn");
+      }
       setStatus(ConnectionStatus.ERROR);
     });
     
@@ -188,7 +208,7 @@ const App: React.FC = () => {
     const id = targetIdInput.trim().toUpperCase();
     if (!id || !peerRef.current) return;
     if (id === myId) {
-      addLog("Self-connection ignored", "warn");
+      addLog("Cannot connect to self", "warn");
       return;
     }
 
@@ -199,11 +219,12 @@ const App: React.FC = () => {
     if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
     connectionTimeoutRef.current = setTimeout(() => {
       if (status !== ConnectionStatus.CONNECTED) {
-        addLog("Handshake timeout", "error");
+        addLog("Handshake timeout. Both peers should refresh and try again.", "error");
         setStatus(ConnectionStatus.ERROR);
       }
-    }, 20000);
+    }, HANDSHAKE_TIMEOUT);
     
+    // 强制使用 JSON 序列化
     const conn = peerRef.current.connect(id, { 
       reliable: true,
       serialization: 'json'
@@ -213,82 +234,74 @@ const App: React.FC = () => {
 
   const copyMyId = () => {
     if (!myId) return;
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(myId);
-      } else {
-        const el = document.createElement('textarea');
-        el.value = myId;
-        document.body.appendChild(el);
-        el.select();
-        document.execCommand('copy');
-        document.body.removeChild(el);
-      }
-      setCopied(true);
-      addLog("ID copied", "success");
+    const doCopy = (text: string) => {
+      const el = document.createElement('textarea');
+      el.value = text;
+      el.setAttribute('readonly', '');
+      el.style.position = 'absolute'; el.style.left = '-9999px';
+      document.body.appendChild(el);
+      el.select(); el.setSelectionRange(0, 99999);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(el);
+      return ok;
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(myId).then(() => {
+        setCopied(true); addLog("ID copied", "success");
+        setTimeout(() => setCopied(false), 2000);
+      }).catch(() => {
+        if(doCopy(myId)) { setCopied(true); addLog("ID copied (fallback)", "success"); setTimeout(() => setCopied(false), 2000); }
+      });
+    } else if (doCopy(myId)) {
+      setCopied(true); addLog("ID copied (legacy)", "success");
       setTimeout(() => setCopied(false), 2000);
-    } catch (e) {
-      addLog("Copy failed", "error");
     }
   };
 
-  // 视频通话发起逻辑 - 直接使用原生 Peer.call
   const startCall = async () => {
     if (!activeTargetId || !peerRef.current) return;
-    
-    addLog("Requesting camera/mic access...", "info");
+    addLog("Requesting camera/mic...", "info");
     setIsInCall(true);
     setIsIncomingCall(false);
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'user', width: 640, height: 480 }, 
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, 
         audio: true 
       });
       setLocalStream(stream);
-      
-      addLog(`Initiating call to ${activeTargetId}...`, "info");
+      addLog(`Calling ${activeTargetId}...`, "info");
       const call = peerRef.current.call(activeTargetId, stream);
-      if (!call) {
-        throw new Error("Call object not created");
-      }
-      
+      if (!call) throw new Error("Call failed");
       callRef.current = call;
       call.on('stream', (remote: MediaStream) => {
-        addLog("Peer answered, stream active", "success");
+        addLog("Call synchronized", "success");
         setRemoteStream(remote);
       });
-      
-      call.on('close', () => {
-        addLog("Call hung up", "info");
-        endCall();
-      });
-
+      call.on('close', endCall);
       call.on('error', (err: any) => {
         addLog(`Call Error: ${err.type}`, "error");
         endCall();
       });
-
     } catch (e) {
-      addLog("Media error or access denied", "error");
+      addLog("Media access denied", "error");
       endCall();
     }
   };
 
   const acceptCall = async () => {
     if (!callRef.current) return;
-    addLog("Accessing media to answer...", "info");
+    addLog("Answering...", "info");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'user', width: 640, height: 480 }, 
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, 
         audio: true 
       });
       setLocalStream(stream);
       callRef.current.answer(stream);
       setIsIncomingCall(false);
-      addLog("Call answered", "success");
     } catch (e) {
-      addLog("Media error", "error");
+      addLog("Answer failed: Media blocked", "error");
       endCall();
     }
   };
@@ -296,11 +309,9 @@ const App: React.FC = () => {
   const endCall = () => {
     if (callRef.current) callRef.current.close();
     if (localStream) localStream.getTracks().forEach(t => t.stop());
-    setLocalStream(null);
-    setRemoteStream(null);
-    setIsInCall(false);
-    setIsIncomingCall(false);
-    addLog("Cleanup complete", "info");
+    setLocalStream(null); setRemoteStream(null);
+    setIsInCall(false); setIsIncomingCall(false);
+    addLog("Call cleanup complete", "info");
   };
 
   const sendMessage = (content: any, type: MessageType = MessageType.TEXT) => {
@@ -322,8 +333,7 @@ const App: React.FC = () => {
     const transferId = uuidv4();
     const arrayBuffer = await file.arrayBuffer();
     const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
-    
-    addLog(`Sending file: ${file.name}`, "info");
+    addLog(`Sending: ${file.name}`, "info");
     setMessages(prev => [...prev, {
       id: uuidv4(), senderId: myId, type: MessageType.SYSTEM, 
       content: `Sending: ${file.name}`, timestamp: Date.now(), transferId
@@ -337,13 +347,11 @@ const App: React.FC = () => {
         content: chunk, timestamp: Date.now(), transferId,
         chunkIndex: i, totalChunks, fileName: file.name
       });
-      
       if (i % 5 === 0) {
         setTransferProgress(prev => ({ ...prev, [transferId]: Math.floor((i / totalChunks) * 100) }));
         await new Promise(r => setTimeout(r, 40));
       }
     }
-    
     setMessages(prev => [...prev, {
       id: transferId, senderId: myId, 
       type: file.type.startsWith('image/') ? MessageType.IMAGE : MessageType.VIDEO_FILE,
@@ -375,22 +383,23 @@ const App: React.FC = () => {
                 <i className="ph-fill ph-link"></i>
               </div>
               <h1 className="text-4xl font-black text-gray-900 mb-2 tracking-tight">P2P Link</h1>
-              <p className="text-gray-400 font-medium text-lg">Serverless & Private</p>
+              <p className="text-gray-400 font-medium text-lg italic">Pure Direct Communication</p>
             </div>
 
-            <div className="bg-gray-50 p-6 rounded-[32px] border border-gray-100 shadow-sm relative">
-              <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4 text-center">Your Device ID</p>
+            <div className="bg-gray-50 p-6 rounded-[32px] border border-gray-100 shadow-sm relative group">
+              <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4 text-center">Your Sharing ID</p>
               <div className="flex items-center justify-between bg-white p-4 rounded-2xl border border-gray-200 shadow-inner">
-                <span className="text-3xl font-mono font-black text-blue-600 tracking-tighter">{myId || '---'}</span>
+                <span className="text-3xl font-mono font-black text-blue-600 tracking-tighter select-all">{myId || '---'}</span>
                 <button 
                   onClick={copyMyId}
                   className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all active:scale-90 ${
-                    copied ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-400'
+                    copied ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-400 hover:text-blue-600'
                   }`}
                 >
                   <i className={`ph-bold ${copied ? 'ph-check' : 'ph-copy'} text-xl`}></i>
                 </button>
               </div>
+              {copied && <p className="absolute -bottom-6 left-0 right-0 text-center text-[9px] font-black text-green-500 uppercase tracking-widest animate-in fade-in slide-in-from-top-1">Copied!</p>}
             </div>
 
             <div className="space-y-4 pt-4">
@@ -398,23 +407,23 @@ const App: React.FC = () => {
                  value={targetIdInput} 
                  onChange={e => setTargetIdInput(e.target.value.toUpperCase())} 
                  placeholder="FRIEND ID"
-                 className="w-full p-5 rounded-[24px] bg-white border-2 border-gray-100 shadow-sm focus:border-blue-500 outline-none text-center font-black text-2xl"
+                 className="w-full p-5 rounded-[24px] bg-white border-2 border-gray-100 shadow-sm focus:border-blue-500 outline-none text-center font-black text-2xl tracking-[0.1em]"
                />
                <button 
                  onClick={connectToPeer} 
                  disabled={!targetIdInput}
-                 className="w-full p-5 rounded-[24px] bg-gray-900 text-white font-black text-xl hover:bg-black transition-all active:scale-95 disabled:opacity-20"
+                 className="w-full p-5 rounded-[24px] bg-gray-900 text-white font-black text-xl hover:bg-black transition-all active:scale-95 disabled:opacity-20 shadow-xl"
                >
-                 Connect Now
+                 Establish Link
                </button>
             </div>
           </div>
         </div>
 
-        <div className="h-40 bg-gray-900 p-5 overflow-y-auto no-scrollbar rounded-t-[40px] border-t border-gray-800">
+        <div className="h-44 bg-gray-900 p-5 overflow-y-auto no-scrollbar rounded-t-[40px] border-t border-gray-800">
           <p className="text-[10px] font-black text-gray-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
-            System Console
+            <span className={`w-1.5 h-1.5 rounded-full ${peerRef.current?.open ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`}></span>
+            System Diagnostics
           </p>
           <div className="space-y-2 font-mono text-[11px]">
             {logs.map(log => (
@@ -429,6 +438,7 @@ const App: React.FC = () => {
                 </span>
               </div>
             ))}
+            {logs.length === 0 && <p className="text-gray-700 italic">Starting engine...</p>}
           </div>
         </div>
       </div>
@@ -441,17 +451,17 @@ const App: React.FC = () => {
         <div className="absolute inset-0 z-50 bg-white/95 backdrop-blur-md flex flex-col items-center justify-center p-8 animate-in fade-in">
           <div className="w-full max-w-sm flex flex-col items-center gap-8">
             <div className={`w-24 h-24 ${status === ConnectionStatus.ERROR ? 'bg-red-50' : 'bg-blue-50'} rounded-full flex items-center justify-center`}>
-              <i className={`ph-fill ${status === ConnectionStatus.ERROR ? 'ph-warning-octagon text-red-500' : 'ph-lightning text-blue-600'} text-4xl animate-pulse`}></i>
+              <i className={`ph-fill ${status === ConnectionStatus.ERROR ? 'ph-warning-octagon text-red-500' : 'ph-lightning text-blue-600'} text-4xl ${status !== ConnectionStatus.ERROR && 'animate-pulse'}`}></i>
             </div>
             
             <div className="text-center">
               <h2 className="text-2xl font-black text-gray-900 mb-1">
                 {status === ConnectionStatus.ERROR ? 'Handshake Failed' : 'Syncing Link'}
               </h2>
-              <p className="text-gray-400 font-bold">Peer: <span className="text-blue-600">{activeTargetId}</span></p>
+              <p className="text-gray-400 font-bold">Target Peer: <span className="text-blue-600">{activeTargetId}</span></p>
             </div>
 
-            <div className="w-full bg-gray-900 p-4 rounded-[24px] h-40 overflow-y-auto no-scrollbar font-mono text-[10px] space-y-1 shadow-inner">
+            <div className="w-full bg-gray-900 p-4 rounded-[24px] h-48 overflow-y-auto no-scrollbar font-mono text-[10px] space-y-1 shadow-2xl">
               {logs.map(log => (
                 <div key={log.id} className={`flex gap-2 ${log.level === 'error' ? 'text-red-400' : 'text-gray-500'}`}>
                   <span>[{log.time}]</span>
@@ -462,9 +472,12 @@ const App: React.FC = () => {
 
             <div className="flex flex-col w-full gap-3">
               {status === ConnectionStatus.ERROR && (
-                <button onClick={connectToPeer} className="w-full py-4 bg-blue-600 text-white font-black rounded-2xl active:scale-95 transition">Retry</button>
+                <>
+                  <p className="text-[11px] text-gray-400 text-center font-bold px-4 mb-2">PRO TIP: Both users should refresh the page if this persists. Avoid switching apps during link-up.</p>
+                  <button onClick={connectToPeer} className="w-full py-4 bg-blue-600 text-white font-black rounded-2xl active:scale-95 transition shadow-lg shadow-blue-100">Retry Linking</button>
+                </>
               )}
-              <button onClick={() => window.location.reload()} className="w-full py-4 bg-gray-100 text-gray-500 font-black rounded-2xl active:scale-95 transition">Abort</button>
+              <button onClick={() => window.location.reload()} className="w-full py-4 bg-gray-100 text-gray-500 font-black rounded-2xl active:scale-95 transition">Abort & Restart</button>
             </div>
           </div>
         </div>
